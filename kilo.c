@@ -16,81 +16,23 @@
 #include <sys/types.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <stdbool.h>
+
+#include "io.c"
+#include "lifetime.h"
+#include "datatypes.h"
 
 /*** defines ***/
 #define KILO_VERSION "0.0.1"
-#define KILO_TAB_STOP 8
+#define KILO_TAB_STOP 4
 #define KILO_FORCE_QUIT_TIMES 3
-
 #define CTRL_KEY(k) ((k) & 0x1f)
-
-enum editorKey {
-    BACKSPACE = 127,
-    ARROW_LEFT = 1000,
-    ARROW_RIGHT,
-    ARROW_UP,
-    ARROW_DOWN,
-    DEL_KEY,
-    HOME_KEY,
-    END_KEY,
-    PAGE_UP,
-    PAGE_DOWN
-};
-
-enum editorHighlight {
-    HL_NORMAL = 0,
-    HL_COMMENT,
-    HL_MLCOMMENT,
-    HL_KEYWORD1,
-    HL_KEYWORD2,
-    HL_STRING,
-    HL_NUMBER,
-    HL_MATCH
-};
-
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
 #define HL_HIGHLIGHT_STRINGS (1<<1)
 
-/*** data ***/
+/*** global variables ***/
 
-typedef struct editorSyntax {
-    char* filetype;
-    char** filematch;
-    char** keywords;
-    char* singleline_comment_start;
-    char* multiline_comment_start;
-    char* multiline_comment_end;
-    int flags;
-} editorSyntax;
-
-typedef struct erow {
-    int idx;
-    int size;
-    int rsize;
-    char* chars;
-    char* render;
-    unsigned char* hl;
-    int hl_open_comment;
-} erow;
-
-typedef struct editorConfig {
-    int cx, cy;
-    int rx;
-    int rowoff;
-    int coloff;
-    int screenrows;
-    int screencols;
-    int numrows;
-    erow* row;
-    int dirty;
-    char* filename;
-    char statusmsg[80];
-    time_t statusmsg_time;
-    editorSyntax* syntax;
-    struct termios orig_termios;
-} editorConfig;
-
-editorConfig E;
+struct termios original_settings;
 
 /*** filetypes ***/
 
@@ -117,31 +59,23 @@ struct editorSyntax HLDB[] = {
 
 /*** prototypes ***/
 
-void editorSetStatusMessage(const char *fmt, ...);
+void editorSetStatusMessage(editorConfig* const editor, const char* fmt, ...);
 void editorRefreshScreen();
-char* editorPrompt(char* prompt, void (*callback)(char*, int));
+char* editorPrompt(editorConfig* const editor, char* prompt, void (*callback)(editorConfig* const, char*, int));
 
 /*** terminal ***/
 
-void die(const char* s){
-    write(STDOUT_FILENO, "\x1b[2J", 4);
-    write(STDOUT_FILENO, "\x1b[H", 3);
-    
-    perror(s);
-    exit(1);
-}
-
 void disableRawMode() {
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_settings) == -1)
         die("tcsetattr");
 }
 
 void enableRawMode(){
-    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
+    if (tcgetattr(STDIN_FILENO, &original_settings) == -1)
         die("tcsetattr");
     atexit(disableRawMode);
     
-    struct termios raw = E.orig_termios;
+    struct termios raw = original_settings;
 
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     raw.c_oflag &= ~(OPOST);
@@ -154,114 +88,22 @@ void enableRawMode(){
         die("tcsetattr");
 }
 
-int editorReadKey() {
-    int nread;
-    char c;
-    while ((nread = read(STDIN_FILENO, &c, 1)) != 1){
-        if (nread == -1 && errno != EAGAIN) die("read");
-    }
-
-    if ( c == '\x1b'){
-        char seq[3];
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
-
-        if (seq[0] == '['){
-            if (seq[1] >= '0' && seq[1] <= '9'){
-                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
-                if (seq[2] == '~') {
-                    switch (seq[1])
-                    {
-                        case '1': return HOME_KEY;
-                        case '3': return DEL_KEY;
-                        case '4': return END_KEY;
-                        case '5': return PAGE_UP;
-                        case '6': return PAGE_DOWN;
-                        case '7': return HOME_KEY;
-                        case '8': return END_KEY;
-                    }
-                }
-            } else {
-                switch (seq[1]) {
-                    case 'A': return ARROW_UP;
-                    case 'B': return ARROW_DOWN;
-                    case 'C': return ARROW_RIGHT;
-                    case 'D': return ARROW_LEFT;
-                    case 'H': return HOME_KEY;
-                    case 'F': return END_KEY;
-                }
-            }
-        } else if (seq[0] == 'O') {
-            switch (seq[1]){
-                case 'A': return ARROW_UP;
-                case 'B': return ARROW_DOWN;
-                case 'C': return ARROW_RIGHT;
-                case 'D': return ARROW_LEFT; // lol
-                case 'H': return HOME_KEY;
-                case 'F': return END_KEY;
-            }
-        }
-
-        return '\x1b';
-    }
-
-    return c;
-}
-
-int getCursorPosition(int* rows, int* cols){
-    char buf[32];
-    unsigned int i = 0;
-
-    if(write(STDOUT_FILENO, "\x1b[6n", 4) != 4) return -1;
-
-    while ( i < sizeof(buf) - 1) {
-        if (read(STDIN_FILENO, &buf[i], 1) != 1) break;
-        if (buf[i] == 'R') break;
-        i++;
-    }
-
-    buf[i] = '\0';
-
-    if (buf[0] != '\x1b' || buf[1] != '[') return -1;
-    if (sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
-
-    return 0;
-}
-
-int getWindowSize(int* rows, int* cols){
-    struct winsize ws;
-
-    if (!rows | !cols) return -1;
-    
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 
-        || ws.ws_col == 0 || ws.ws_row == 0){
-        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
-            return -1;
-        return getCursorPosition(rows, cols);
-    } else {
-        *cols = ws.ws_col;
-        *rows = ws.ws_row;
-        return 0;
-    }
-    
-}
-
 /*** syntax highlighting ***/
 
 int is_separator(int c) {
     return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
 }
 
-void editorUpdateSyntax(erow* row) {
+void editorUpdateSyntax(editorConfig* const E, erow* row) {
     row->hl = realloc(row->hl, row->rsize);
     memset(row->hl, HL_NORMAL, row->size); // turns out we need it ; )
 
-    if (E.syntax == NULL) return;
+    if (E->syntax == NULL) return;
 
-    char** keywords = E.syntax->keywords;    
-    char* scs = E.syntax->singleline_comment_start;
-    char* mcs = E.syntax->multiline_comment_start;
-    char* mce = E.syntax->multiline_comment_end;
+    char** keywords = E->syntax->keywords;
+    char* scs = E->syntax->singleline_comment_start;
+    char* mcs = E->syntax->multiline_comment_start;
+    char* mce = E->syntax->multiline_comment_end;
 
     int scs_len = scs ? strlen(scs) : 0;
     int mcs_len = mcs ? strlen(mcs) : 0;
@@ -269,7 +111,7 @@ void editorUpdateSyntax(erow* row) {
 
     int prev_sep = 1;
     int in_string = 0;
-    int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
+    int in_comment = (row->idx > 0 && E->row[row->idx - 1].hl_open_comment);
 
     int i = 0;
     while (i < row->rsize) {
@@ -304,7 +146,7 @@ void editorUpdateSyntax(erow* row) {
             }
         }
 
-        if (E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+        if (E->syntax->flags & HL_HIGHLIGHT_STRINGS) {
             if (in_string) {
                 row->hl[i] = HL_STRING;
                 if (c == '\\' && i + 1 < row->size) {
@@ -324,7 +166,7 @@ void editorUpdateSyntax(erow* row) {
             }
         }
 
-        if ((E.syntax->flags & HL_HIGHLIGHT_NUMBERS) &&
+        if ((E->syntax->flags & HL_HIGHLIGHT_NUMBERS) &&
             ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) || 
             (c == '.' && prev_hl == HL_NUMBER))) {
             row->hl[i] = HL_NUMBER;
@@ -361,8 +203,8 @@ void editorUpdateSyntax(erow* row) {
 
     int changed = (row->hl_open_comment != in_comment);
     row->hl_open_comment = in_comment;
-    if (changed && row->idx + 1 < E.numrows)
-        editorUpdateSyntax(&E.row[row->idx + 1]);
+    if (changed && row->idx + 1 < E->numrows)
+        editorUpdateSyntax(E, &E->row[row->idx + 1]);
 }
 
 int editorSyntaxToColor(int hl) {
@@ -378,11 +220,11 @@ int editorSyntaxToColor(int hl) {
     }
 }
 
-void editorSelectSyntaxHighlight() {
-    E.syntax = NULL;
-    if (E.filename == NULL) return;
+void editorSelectSyntaxHighlight(editorConfig* const E) {
+    E->syntax = NULL;
+    if (E->filename == NULL) return;
 
-    char* ext = strrchr(E.filename, '.');
+    char* ext = strrchr(E->filename, '.');
 
     for (unsigned int i = 0; i < HLDB_ENTRIES; ++i) {
         editorSyntax* s = &HLDB[i];
@@ -391,13 +233,13 @@ void editorSelectSyntaxHighlight() {
         while (s->filematch[e]) {
             int is_ext = (s->filematch[e][0] == '.');
             if ((is_ext && ext && !strcmp(ext, s->filematch[e])) ||
-                (!is_ext && strstr(E.filename, s->filematch[e]))) {
-                    E.syntax = s;
+                (!is_ext && strstr(E->filename, s->filematch[e]))) {
+                    E->syntax = s;
 
                     int filerow;
 
-                    for (filerow = 0; filerow < E.numrows; ++filerow) {
-                        editorUpdateSyntax(&E.row[filerow]);
+                    for (filerow = 0; filerow < E->numrows; ++filerow) {
+                        editorUpdateSyntax(E, &E->row[filerow]);
                     }
 
                     return;
@@ -411,8 +253,7 @@ void editorSelectSyntaxHighlight() {
 
 int editorRowCxToRx(erow* row, int cx) {
     int rx = 0;
-    int i;
-    for (i = 0; i < cx; i++){
+    for (int i = 0; i < cx; i++){
         if (row->chars[i] == '\t')
             rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
         ++rx;
@@ -435,18 +276,16 @@ int editorRowRxToCx(erow* row, int rx) {
     return cx;
 }
 
-void editorUpdateRow(erow* row) {
+void editorUpdateRow(editorConfig* const E, erow* row) {
     int tabs = 0;
-    int i;
 
-    for (i = 0; i < row->size; i++)
+    for (int i = 0; i < row->size; i++)
         if (row->chars[i] == '\t') ++tabs;
     
-    free(row->render);
-    row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+    row->render = realloc(row->render, row->size + tabs * (KILO_TAB_STOP - 1) + 1);
     
     int idx = 0;
-    for (i = 0; i < row->size; ++i) {
+    for (int i = 0; i < row->size; ++i) {
         if (row->chars[i] == '\t'){
             row->render[idx++] = ' ';
             while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
@@ -457,31 +296,31 @@ void editorUpdateRow(erow* row) {
 
     row->render[idx] = '\0';
     row->rsize = idx;
-    editorUpdateSyntax(row);
+    editorUpdateSyntax(E, row);
 }
 
-void editorInsertRow(int at, char* s, size_t len) {
+void editorInsertRow(editorConfig* const E, int at, char* s, size_t len) {
     // doesnot handle oom
-    if (at < 0 || at > E.numrows) return;
+    if (at < 0 || at > E->numrows) return;
 
-    E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
-    memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
-    for (int j = at + 1; j <= E.numrows; j++) E.row[j].idx++;
+    E->row = realloc(E->row, sizeof(erow) * (E->numrows + 1));
+    memmove(&E->row[at + 1], &E->row[at], sizeof(erow) * (E->numrows - at));
+    for (int j = at + 1; j <= E->numrows; j++) E->row[j].idx++;
 
-    E.row[at].idx = at;
-    E.row[at].size = len;
-    E.row[at].chars = malloc(len + 1);
-    memcpy(E.row[at].chars, s, len);
-    E.row[at].chars[len] = '\0';
+    E->row[at].idx = at;
+    E->row[at].size = len;
+    E->row[at].chars = malloc(len + 1);
+    memcpy(E->row[at].chars, s, len);
+    E->row[at].chars[len] = '\0';
 
-    E.row[at].rsize = 0;
-    E.row[at].render = NULL;
-    E.row[at].hl = NULL;
-    E.row[at].hl_open_comment = 0;
-    editorUpdateRow(&E.row[at]);
+    E->row[at].rsize = 0;
+    E->row[at].render = NULL;
+    E->row[at].hl = NULL;
+    E->row[at].hl_open_comment = 0;
+    editorUpdateRow(E, &E->row[at]);
 
-    ++E.numrows;
-    ++E.dirty;
+    ++E->numrows;
+    ++E->dirty;
 }
 
 void editorFreeRow(erow* row) {
@@ -490,100 +329,100 @@ void editorFreeRow(erow* row) {
     free(row->hl);
 }
 
-void editorDelRow(int at) {
-    if (at < 0 || at >= E.numrows) return;
-    editorFreeRow(&E.row[at]);
-    memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
-    for (int j = at; j < E.numrows - 1; j++) E.row[j].idx--;
-    --E.numrows;
-    ++E.dirty;
+void editorDelRow(editorConfig* const E, int at) {
+    if (at < 0 || at >= E->numrows) return;
+    editorFreeRow(&E->row[at]);
+    memmove(&E->row[at], &E->row[at + 1], sizeof(erow) * (E->numrows - at - 1));
+    for (int j = at; j < E->numrows - 1; j++) E->row[j].idx--;
+    --E->numrows;
+    ++E->dirty;
 }
 
-void editorRowInsertChar(erow* row, int at, int c) {
+void editorRowInsertChar(editorConfig* const E, erow* row, int at, int c) {
     if (at < 0 || at > row->size) at = row->size;
     row->chars = realloc(row->chars, row->size + 2);
     //memcpy isn't safe to use on the same memory
     memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
     ++row->size;
     row->chars[at] = c;
-    editorUpdateRow(row);
-    ++E.dirty;
+    editorUpdateRow(E, row);
+    ++E->dirty;
 }
 
-void editorRowAppendString(erow* row, char* s, size_t len) {
+void editorRowAppendString(editorConfig* const E, erow* row, char* s, size_t len) {
     row->chars = realloc(row->chars, row->size + len + 1);
     memcpy(&row->chars[row->size], s, len);
     row->size += len;
     row->chars[row->size]  = '\0';
-    editorUpdateRow(row);
-    ++E.dirty;
+    editorUpdateRow(E, row);
+    ++E->dirty;
 }
 
-void editorRowDelChar(erow* row, int at) {
+void editorRowDelChar(editorConfig* const E, erow* row, int at) {
     if (at < 0 || at >= row->size) return;
     memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
     --row->size;
-    editorUpdateRow(row);
-    ++E.dirty;
+    editorUpdateRow(E, row);
+    ++E->dirty;
 }
 
 /*** editor operations ***/
 
-void editorInsertChar(int c) {
-    if (E.cy == E.numrows) {
-        editorInsertRow(E.numrows, "", 0);
+void editorInsertChar(editorConfig* const E, int c) {
+    if (E->cy == E->numrows) {
+        editorInsertRow(E, E->numrows, "", 0);
     }
-    editorRowInsertChar(&E.row[E.cy], E.cx, c);
-    ++E.cx;
+    editorRowInsertChar(E, &E->row[E->cy], E->cx, c);
+    ++E->cx;
 }
 
-void editorInsertNewline() {
-    if (E.cx == 0) {
-        editorInsertRow(E.cy, "", 0);
+void editorInsertNewline(editorConfig* const E) {
+    if (E->cx == 0) {
+        editorInsertRow(E, E->cy, "", 0);
     } else {
-        erow* row = &E.row[E.cy];
+        erow* row = &E->row[E->cy];
         // may invalidate row because of realloc:
-        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
-        row = &E.row[E.cy]; // reassign
-        row->size = E.cx;
+        editorInsertRow(E, E->cy + 1, &row->chars[E->cx], row->size - E->cx);
+        row = &E->row[E->cy]; // reassign
+        row->size = E->cx;
         row->chars[row->size] = '\0';
-        editorUpdateRow(row);
+        editorUpdateRow(E, row);
     }
 
-    ++E.cy;
-    E.cx = 0;
+    ++E->cy;
+    E->cx = 0;
 }
 
-void editorDelChar() {
-    if (E.cy == E.numrows) return;
-    if (E.cx == 0 && E.cy == 0) return;
+void editorDelChar(editorConfig* const E) {
+    if (E->cy == E->numrows) return;
+    if (E->cx == 0 && E->cy == 0) return;
 
-    erow* row = &E.row[E.cy];
-    if (E.cx > 0) {
-        editorRowDelChar(row, E.cx - 1);
-        --E.cx;
+    erow* row = &E->row[E->cy];
+    if (E->cx > 0) {
+        editorRowDelChar(E, row, E->cx - 1);
+        --E->cx;
     } else {
-        E.cx = E.row[E.cy - 1].size;
-        editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
-        editorDelRow(E.cy);
-        --E.cy;
+        E->cx = E->row[E->cy - 1].size;
+        editorRowAppendString(E, &E->row[E->cy - 1], row->chars, row->size);
+        editorDelRow(E, E->cy);
+        --E->cy;
     }
 }
 
 /*** file i/o ***/
 
-char* editorRowToString(int* buflen){
-    int totlen = 0;
-    int i;
-    for (i = 0; i < E.numrows; ++i)
-        totlen += E.row[i].size + 1;
-    *buflen = totlen;
+char* editorRowToString(editorConfig* const E, int* buflen){
+    int totalen = 0;
 
-    char* buf = malloc(totlen);
+    for (int i = 0; i < E->numrows; ++i)
+        totalen += E->row[i].size + 1;
+    *buflen = totalen;
+
+    char* buf = malloc(totalen);
     char* p = buf;
-    for(i = 0; i < E.numrows; ++i) {
-        memcpy(p, E.row[i].chars, E.row[i].size);
-        p += E.row[i].size;
+    for(int i = 0; i < E->numrows; ++i) {
+        memcpy(p, E->row[i].chars, E->row[i].size);
+        p += E->row[i].size;
         *p = '\n';
         ++p;
     }
@@ -591,11 +430,11 @@ char* editorRowToString(int* buflen){
     return buf;
 }
 
-void editorOpen(char* filename) {
-    free(E.filename);
-    E.filename = strdup(filename);
+void editorOpen(editorConfig* const E, char* filename) {
+    free(E->filename);
+    E->filename = strdup(filename);
 
-    editorSelectSyntaxHighlight();
+    editorSelectSyntaxHighlight(E);
 
     FILE* fp = fopen(filename, "r");
     if (!fp) die("fopen");
@@ -606,37 +445,37 @@ void editorOpen(char* filename) {
     while ((linelen = getline(&line, &linecap, fp)) != -1){
         while(linelen > 0 && (line[linelen - 1] == '\n' || 
             line[linelen - 1] == '\r')) --linelen;
-        editorInsertRow(E.numrows, line, linelen);
+        editorInsertRow(E, E->numrows, line, linelen);
     }
     free(line);
     fclose(fp);
-    E.dirty = 0;
+    E->dirty = 0;
 }
 
-int editorSave() {
+int editorSave(editorConfig* const E) {
     // should check return vals
-    if (E.filename == NULL) {
-        E.filename = editorPrompt("Save as: %s", NULL);
+    if (E->filename == NULL) {
+        E->filename = editorPrompt(E, "Save as: %s", NULL);
 
-        if (E.filename == NULL) {
-            editorSetStatusMessage("Save aborted");
+        if (E->filename == NULL) {
+            editorSetStatusMessage(E, "Save aborted");
             return -2;
         }
 
-        editorSelectSyntaxHighlight();
+        editorSelectSyntaxHighlight(E);
     }
 
     int len;
-    char* buf = editorRowToString(&len);
+    char* buf = editorRowToString(E, &len);
 
-    int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+    int fd = open(E->filename, O_RDWR | O_CREAT, 0644);
     if (fd != -1) {
         if (ftruncate(fd, len) != -1) {
             if (write(fd, buf, len) == len) {
                 // if write fails, we retain data up to len.
                 close(fd);
                 free(buf);
-                E.dirty = 0;
+                E->dirty = 0;
                 return 0;
             }
         }
@@ -649,7 +488,7 @@ int editorSave() {
 
 /*** find ***/
 
-void editorFindCallback(char* query, int key) {
+void editorFindCallback(editorConfig* const E, char* query, int key) {
     static int last_match = -1;
     static int direction = 1;
 
@@ -657,7 +496,7 @@ void editorFindCallback(char* query, int key) {
     static char* saved_hl = NULL;
 
     if (saved_hl) {
-        memcpy(E.row[saved_hl_line].hl, saved_hl, E.row[saved_hl_line].rsize);
+        memcpy(E->row[saved_hl_line].hl, saved_hl, E->row[saved_hl_line].rsize);
         free(saved_hl);
         saved_hl = NULL;
     }
@@ -678,19 +517,18 @@ void editorFindCallback(char* query, int key) {
     if (last_match == -1) direction = 1;
     int current = last_match;
 
-    int i;
-    for (i = 0; i < E.numrows; ++i) {
+    for (int i = 0; i < E->numrows; ++i) {
         current += direction;
-        if (current == -1) current = E.numrows - 1;
-        else if (current == E.numrows) current = 0;
+        if (current == -1) current = E->numrows - 1;
+        else if (current == E->numrows) current = 0;
 
-        erow* row = &E.row[current];
+        erow* row = &E->row[current];
         char* match = strstr(row->render, query);
         if (match) {
             last_match = current;
-            E.cy = current;
-            E.cx = editorRowRxToCx(row, match - row->render);
-            E.rowoff = E.cy; // brah why did they make it E.numrows they are stupid
+            E->cy = current;
+            E->cx = editorRowRxToCx(row, match - row->render);
+            E->rowoff = E->cy; // brah why did they make it E.numrows they are stupid
 
             saved_hl_line = current;
             saved_hl = malloc(row->rsize);
@@ -701,19 +539,19 @@ void editorFindCallback(char* query, int key) {
     }
 }
 
-void editorFind() {
-    int saved_cx = E.cx;
-    int saved_cy = E.cy;
-    int saved_coloff = E.coloff;
-    int saved_rowoff = E.rowoff;
+void editorFind(editorConfig* const E) {
+    int saved_cx = E->cx;
+    int saved_cy = E->cy;
+    int saved_coloff = E->coloff;
+    int saved_rowoff = E->rowoff;
 
-    char* query = editorPrompt("Search: %s (Use ESC/Arrows/Enter)", editorFindCallback);
+    char* query = editorPrompt(E, "Search: %s (Use ESC/Arrows/Enter)", editorFindCallback);
     
     if(!query) {
-        E.cx = saved_cx;
-        E.cy = saved_cy;
-        E.coloff = saved_coloff;
-        E.rowoff = saved_rowoff;
+        E->cx = saved_cx;
+        E->cy = saved_cy;
+        E->coloff = saved_coloff;
+        E->rowoff = saved_rowoff;
     }
 
     free(query); // tutorial checks if not null, but we can free null.
@@ -744,69 +582,76 @@ void abFree(abuf* ab){
 
 #define ABUF_INIT {NULL , 0}
 
+/*** escape room ***/
+
+int escapeSetColor(abuf* ab, int current_color){
+    char buf[16];
+    int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+    return abAppend(ab, buf, clen);
+}
+
 /*** output ***/
 
-void editorScroll() {
-    E.rx = 0;
-    if (E.cy < E.numrows) {
-        E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+void editorScroll(editorConfig* const E) {
+    E->rx = 0;
+    if (E->cy < E->numrows) {
+        E->rx = editorRowCxToRx(&E->row[E->cy], E->cx);
     }
 
-    if (E.cy < E.rowoff) {
-        E.rowoff = E.cy;
+    if (E->cy < E->rowoff) {
+        E->rowoff = E->cy;
     }
-    if (E.cy >= E.rowoff + E.screenrows) {
-        E.rowoff = E.cy - E.screenrows + 1;
+    if (E->cy >= E->rowoff + E->screenrows) {
+        E->rowoff = E->cy - E->screenrows + 1;
     }
-    if (E.rx < E.coloff){
-        E.coloff = E.rx;
+    if (E->rx < E->coloff){
+        E->coloff = E->rx;
     }
-    if (E.rx >= E.coloff + E.screencols) {
-        E.coloff = E.rx - E.screencols + 1;
+    if (E->rx >= E->coloff + E->screencols) {
+        E->coloff = E->rx - E->screencols + 1;
     }
 }
 
-void editorDrawRows(abuf* ab){
-    int y;
-    for (y = 0; y < E.screenrows; ++y){
-        int filerow = y + E.rowoff;
-        if (filerow >= E.numrows) {
-            if (E.numrows == 0 && y == E.screenrows / 3){
-                char welcome[80];
-                int welcomelen = snprintf(welcome, sizeof(welcome),
-                "Kilo editor -- version %s", KILO_VERSION);
+void editorAppendWelcome(editorConfig* const E, abuf* ab){
+    char welcome[80];
+    int welcomelen = snprintf(welcome, sizeof(welcome),
+    "Kilo editor -- version %s", KILO_VERSION);
 
-                if (welcomelen > E.screencols) welcomelen = E.screencols;
-                int padding = (E.screencols - welcomelen) / 2;
-                if (padding){
-                    abAppend(ab, "~", 1);
-                    while (--padding) abAppend(ab, " ", 1);
-                }
+    if (welcomelen > E->screencols) welcomelen = E->screencols;
+    int padding = (E->screencols - welcomelen) / 2;
+    if (padding){
+        abAppend(ab, "~", 1);
+        while (--padding) abAppend(ab, " ", 1);
+    }
 
-                abAppend(ab, welcome, welcomelen);
+    abAppend(ab, welcome, welcomelen);
+}
+
+void editorDrawRows(editorConfig* const E, abuf* ab){
+    for (int y = 0; y < E->screenrows; ++y){
+        int filerow = y + E->rowoff;
+        if (filerow >= E->numrows) {
+            if (E->numrows == 0 && y == E->screenrows / 3){
+                editorAppendWelcome(E, ab);
             } else {
                 abAppend(ab, "~", 1);
             }
         } else {
-            int len = E.row[filerow].rsize - E.coloff;
+            int len = E->row[filerow].rsize - E->coloff;
             if (len < 0) len = 0;
-            if (len > E.screencols) len = E.screencols;
-            char* c = &E.row[filerow].render[E.coloff];
-            unsigned char* hl = &E.row[filerow].hl[E.coloff];
+            if (len > E->screencols) len = E->screencols;
+            char* c = &E->row[filerow].render[E->coloff];
+            unsigned char* hl = &E->row[filerow].hl[E->coloff];
 
             int current_color = -1;
-            int j;
-            for(j = 0; j < len; ++j) {
+            
+            for(int j = 0; j < len; ++j) {
                 if (iscntrl((int)c[j])) {
                     char sym = (c[j] <= 26) ? '@' + c[j] : '?';
                     abAppend(ab, "\x1b[7m", 4);
                     abAppend(ab, &sym, 1);
                     abAppend(ab, "\x1b[m", 3);
-                    if (current_color != -1) {
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
-                        abAppend(ab, buf, clen);
-                    }
+                    if (current_color != -1) escapeSetColor(ab, current_color);
                 }
                 else if (hl[j] == HL_NORMAL) {
                     if (current_color != - 1) {
@@ -818,9 +663,7 @@ void editorDrawRows(abuf* ab){
                     int color = editorSyntaxToColor(hl[j]);
                     if (color != current_color) {
                         current_color = color;
-                        char buf[16];
-                        int clen = snprintf(buf, sizeof buf, "\x1b[%dm", color);
-                        abAppend(ab, buf, clen);
+                        escapeSetColor(ab, current_color);
                     }
                     abAppend(ab, &c[j], 1);
                 }
@@ -831,22 +674,22 @@ void editorDrawRows(abuf* ab){
 
         abAppend(ab, "\x1b[K", 3);
         abAppend(ab, "\r\n", 2);
-    }    
+    }
 }
 
-void editorDrawStatusBar(abuf* ab){
+void editorDrawStatusBar(editorConfig* const E, abuf* ab){
     abAppend(ab, "\x1b[7m", 4);
     char status[80], rstatus[80];
     int len = snprintf(status, sizeof status, "%.20s - %d lines %s",
-        E.filename ? E.filename : "[No Name]", E.numrows, 
-        E.dirty ? "(modified)" : "");
+        E->filename ? E->filename : "[No Name]", E->numrows, 
+        E->dirty ? "(modified)" : "");
     int rlen = snprintf(rstatus, sizeof rstatus, "%s | %d/%d", 
-        E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
+        E->syntax ? E->syntax->filetype : "no ft", E->cy + 1, E->numrows);
 
-    if (len > E.screencols) len = E.screencols;
+    if (len > E->screencols) len = E->screencols;
     abAppend(ab, status, len);
-    while (len < E.screencols) {
-        if (E.screencols - len == rlen) {
+    while (len < E->screencols) {
+        if (E->screencols - len == rlen) {
             abAppend(ab, rstatus, rlen);
             break;
         } else {
@@ -858,35 +701,35 @@ void editorDrawStatusBar(abuf* ab){
     abAppend(ab, "\r\n", 2);
 }
 
-void editorDrawMessageBar(abuf* ab){
+void editorDrawMessageBar(editorConfig* const E, abuf* ab){
     abAppend(ab, "\x1b[K", 3);
-    int msglen = strlen(E.statusmsg);
-    if (msglen > E.screencols) msglen = E.screencols;
+    int msglen = strlen(E->statusmsg);
+    if (msglen > E->screencols) msglen = E->screencols;
     int i = 0;
-    while(i++ < (E.screencols - msglen) / 2) abAppend(ab, " ", 1);
+    while(i++ < (E->screencols - msglen) / 2) abAppend(ab, " ", 1);
     
     abAppend(ab, "\x1b[4m", 4);
-    if (msglen && time(NULL) - E.statusmsg_time < 5)
-        abAppend(ab, E.statusmsg, msglen);
+    if (msglen && time(NULL) - E->statusmsg_time < 5)
+        abAppend(ab, E->statusmsg, msglen);
     abAppend(ab, "\x1b[m", 4);
 }
 
-void editorRefreshScreen() {
+void editorRefreshScreen(editorConfig* const editor) {
     // unhandeld oom (abAppend)
-    editorScroll();
+    editorScroll(editor);
 
     abuf ab = ABUF_INIT;
 
     abAppend(&ab, "\x1b[?25l", 6);
     abAppend(&ab, "\x1b[H", 3);
 
-    editorDrawRows(&ab);
-    editorDrawStatusBar(&ab);
-    editorDrawMessageBar(&ab);
+    editorDrawRows(editor, &ab);
+    editorDrawStatusBar(editor, &ab);
+    editorDrawMessageBar(editor, &ab);
 
     char buf[32];
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", 
-        (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+        (editor->cy - editor->rowoff) + 1, (editor->rx - editor->coloff) + 1);
     
     abAppend(&ab, buf, strlen(buf));
 
@@ -896,17 +739,17 @@ void editorRefreshScreen() {
     abFree(&ab);
 }
 
-void editorSetStatusMessage(const char* fmt, ...){
+void editorSetStatusMessage(editorConfig* const editor, const char* fmt, ...){
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(E.statusmsg, sizeof E.statusmsg, fmt, ap);
+    vsnprintf(editor->statusmsg, sizeof editor->statusmsg, fmt, ap);
     va_end(ap);
-    E.statusmsg_time = time(NULL);
+    editor->statusmsg_time = time(NULL);
 }
 
 /*** input ***/
 
-char* editorPrompt(char* prompt, void (*callback)(char*, int)) {
+char* editorPrompt(editorConfig* const editor, char* prompt, void (*callback)(editorConfig* const, char*, int)) {
     size_t bufsize = 128;
     char* buf = malloc(bufsize);
 
@@ -914,18 +757,18 @@ char* editorPrompt(char* prompt, void (*callback)(char*, int)) {
     buf[0] = '\0';
 
     while (1){
-        editorSetStatusMessage(prompt, buf);
-        editorRefreshScreen();
+        editorSetStatusMessage(editor, prompt, buf);
+        editorRefreshScreen(editor);
         int c = editorReadKey();
         if (c == '\x1b') {
-            editorSetStatusMessage("");
-            if (callback) callback(buf, c);
+            editorSetStatusMessage(editor, "");
+            if (callback) callback(editor, buf, c);
             free(buf);
             return NULL;
         } else if (c == '\r') {
             if (insize != 0) {
-                editorSetStatusMessage("");
-                if (callback) callback(buf, c);
+                editorSetStatusMessage(editor, "");
+                if (callback) callback(editor, buf, c);
                 return buf;
             }
         } else if (c == BACKSPACE || c == CTRL_KEY('h')) {
@@ -939,46 +782,46 @@ char* editorPrompt(char* prompt, void (*callback)(char*, int)) {
             buf[insize] = '\0';
         }
 
-        if (callback) callback(buf, c);
+        if (callback) callback(editor, buf, c);
     }
 }
 
-void editorMoveCursor(int key){
-    erow* row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+void editorMoveCursor(editorConfig* const E, int key){
+    erow* row = (E->cy >= E->numrows) ? NULL : &E->row[E->cy];
 
     switch (key) {
         case ARROW_LEFT:
-            if (E.cx != 0) {
-                --E.cx;
-            } else if (E.cy > 0) {
-                --E.cy;
-                E.cx = E.row[E.cy].size;
+            if (E->cx != 0) {
+                --E->cx;
+            } else if (E->cy > 0) {
+                --E->cy;
+                E->cx = E->row[E->cy].size;
             }
             break;
         case ARROW_RIGHT:
-            if (row && E.cx < row->size){
-                ++E.cx;
-            } else if (E.cy < E.numrows) {
-                ++E.cy;
-                E.cx = 0;
+            if (row && E->cx < row->size){
+                ++E->cx;
+            } else if (E->cy < E->numrows) {
+                ++E->cy;
+                E->cx = 0;
             }
             break;
         case ARROW_UP:
-            if (E.cy != 0) --E.cy;
+            if (E->cy != 0) --E->cy;
             break;
         case ARROW_DOWN:
-            if (E.cy < E.numrows) ++E.cy;
+            if (E->cy < E->numrows) ++E->cy;
             break;
     }
 
-    row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    row = (E->cy >= E->numrows) ? NULL : &E->row[E->cy];
     int rowlen = row ? row->size : 0;
-    if (E.cx > rowlen) {
-        E.cx = rowlen;
+    if (E->cx > rowlen) {
+        E->cx = rowlen;
     }
 }
 
-void editorProcessKeypress() {
+void editorProcessKeypress(editorConfig* const editor) {
     static int quit_times = KILO_FORCE_QUIT_TIMES;
 
     int c = editorReadKey();
@@ -986,22 +829,22 @@ void editorProcessKeypress() {
     switch (c)
     {
     case '\r':
-        editorInsertNewline();
+        editorInsertNewline(editor);
         break;
     
     case CTRL_KEY ('s'):
         {
-            int result = editorSave();
+            int result = editorSave(editor);
             if (result != -1) 
-                editorSetStatusMessage("Saved file %.20s", E.filename);
+                editorSetStatusMessage(editor, "Saved file %.20s", editor->filename);
             else if (result == 0)
-                editorSetStatusMessage("Can't save! I/O error: %.40s", strerror(errno));
+                editorSetStatusMessage(editor, "Can't save! I/O error: %.40s", strerror(errno));
         }
         break;
 
     case CTRL_KEY('q'):
-        if (E.dirty && quit_times > 0) {
-            editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+        if (editor->dirty && quit_times > 0) {
+            editorSetStatusMessage(editor, "WARNING!!! File has unsaved changes. "
                 "Press Ctrl-Q %d more times to quit.", quit_times--);
             return;
         }
@@ -1011,37 +854,34 @@ void editorProcessKeypress() {
         break;
     
     case HOME_KEY:
-        E.cx = 0;
+        editor->cx = 0;
         break;
     
     case END_KEY:
-        if (E.cy < E.numrows)
-            E.cx = E.row[E.cy].size;
+        if (editor->cy < editor->numrows)
+            editor->cx = editor->row[editor->cy].size;
         break;
     
     case CTRL_KEY('f'):
-        editorFind();
+        editorFind(editor);
         break;
     
     case BACKSPACE:
     case CTRL_KEY('h'):
     case DEL_KEY:
-    if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
-        editorDelChar();
+        if (c == DEL_KEY) editorMoveCursor(editor, ARROW_RIGHT);
+        editorDelChar(editor);
         break;
 
     case PAGE_DOWN:
     case PAGE_UP:
         {
-        if (c == PAGE_UP) {
-            E.cy = E.rowoff;
-        } else if (c == PAGE_DOWN){
-            E.cy = E.rowoff + E.screenrows - 1;
-            if (E.cy > E.numrows) E.cy = E.numrows;
-        }
-        int times = E.screenrows;
+        editor->cy = c == PAGE_UP ? editor->rowoff : editor->rowoff + editor->screenrows - 1;
+        if (editor->cy > editor->numrows) editor->cy = editor->numrows; // cap E.cy
+
+        int times = editor->screenrows;
         while (times--)
-          editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+          editorMoveCursor(editor, c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
         }
       break;
     
@@ -1049,7 +889,7 @@ void editorProcessKeypress() {
     case ARROW_DOWN:
     case ARROW_LEFT:
     case ARROW_RIGHT:
-        editorMoveCursor(c);
+        editorMoveCursor(editor, c);
         break;
     
     case CTRL_KEY('l'):
@@ -1057,7 +897,7 @@ void editorProcessKeypress() {
         break;
     
     default:
-        editorInsertChar(c);
+        editorInsertChar(editor, c);
         break;
     }
 
@@ -1066,46 +906,47 @@ void editorProcessKeypress() {
 
 /*** init ***/
 
-void set_window_size(){
-    if(getWindowSize(&E.screenrows, &E.screencols) == - 1) die("getWindowSize");
+void set_window_size(editorConfig* const editor){
+    if(getWindowSize(&editor->screenrows, &editor->screencols) == - 1) die("getWindowSize");
 
-    E.screenrows -= 2; // Save one for status bar
-    if (E.screenrows <= 0) die ("screenrows <= 0");
+    editor->screenrows -= 2; // Save one for status bar
+    if (editor->screenrows <= 0) die ("screenrows <= 0");
 }
 
-void initEditor(){
-    E.cx = 0;
-    E.cy = 0;
-    E.rx = 0;
-    E.rowoff = 0;
-    E.coloff = 0;
-    E.numrows = 0;
-    E.row = NULL;
-    E.dirty = 0;
-    E.filename = NULL;
-    E.statusmsg[0] = '\0';
-    E.statusmsg_time = 0;
-    E.syntax = NULL;
+editorConfig initEditor(){
+    editorConfig editor;
+    editor.cx = 0;
+    editor.cy = 0;
+    editor.rx = 0;
+    editor.rowoff = 0;
+    editor.coloff = 0;
+    editor.numrows = 0;
+    editor.row = NULL;
+    editor.dirty = 0;
+    editor.filename = NULL;
+    editor.statusmsg[0] = '\0';
+    editor.statusmsg_time = 0;
+    editor.syntax = NULL;
 
-    set_window_size();    
+    set_window_size(&editor);
+
+    return editor;
 }
 
 
 int main(int argc, char* argv[]){
+    editorConfig editor = initEditor();
     enableRawMode();
-    initEditor();
-    if (argc >= 2) 
-    {
-        editorOpen(argv[1]);
-    }
 
-    editorSetStatusMessage(
-        "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+    if (argc >= 2)
+        editorOpen(&editor, argv[1]);
 
-    while (1) {           
-        editorRefreshScreen();
-        editorProcessKeypress();
-        set_window_size(); // resize if screen changes
+    editorSetStatusMessage(&editor, "HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
+
+    while (true) {
+        editorRefreshScreen(&editor);
+        editorProcessKeypress(&editor);
+        set_window_size(&editor); // resize if screen changes
     }
     
     return 0;
