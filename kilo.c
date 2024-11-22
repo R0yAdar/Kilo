@@ -376,13 +376,48 @@ void editorInsertChar(editorConfig* const E, int c) {
     ++E->cx;
 }
 
+int editorCountIndentation(const char* from, int until) {
+    int indent_count = 0;
+
+    while (indent_count < until && from[indent_count] != '\0'){
+        if (from[indent_count] == ' ') ++indent_count;
+        else if (from[indent_count] == '\t') ++indent_count;
+        else break;
+    }
+
+    return indent_count;
+}
+
+
+void editorCopyIndentation(const char* indentation_source, const char* text_source, char* to, int indent_count) {
+    int text_len = strlen(text_source);
+    
+    memcpy(to, indentation_source, indent_count);
+    memcpy(&to[indent_count], text_source, text_len);
+}
+
 void editorInsertNewline(editorConfig* const E) {
+    int new_cx = 0;
     if (E->cx == 0) {
         editorInsertRow(E, E->cy, "", 0);
     } else {
         erow* row = &E->row[E->cy];
-        // may invalidate row because of realloc:
-        editorInsertRow(E, E->cy + 1, &row->chars[E->cx], row->size - E->cx);
+
+        int indentation = editorCountIndentation(row->chars, E->cx);
+        if (indentation > 0) {
+            new_cx = indentation;
+            int indented_line_chars_count = indentation + row->size - E->cx;
+            char* indented_line = malloc(indented_line_chars_count);
+            editorCopyIndentation(row->chars, &row->chars[E->cx], indented_line, indentation);
+
+            editorInsertRow(E, E->cy + 1, indented_line, indented_line_chars_count);
+            
+            free(indented_line);
+        } else {
+            // may invalidate row because of realloc:
+            editorInsertRow(E, E->cy + 1, &row->chars[E->cx], row->size - E->cx);
+        }
+
         row = &E->row[E->cy]; // reassign
         row->size = E->cx;
         row->chars[row->size] = '\0';
@@ -390,7 +425,7 @@ void editorInsertNewline(editorConfig* const E) {
     }
 
     ++E->cy;
-    E->cx = 0;
+    E->cx = new_cx;
 }
 
 void editorDelChar(editorConfig* const E) {
