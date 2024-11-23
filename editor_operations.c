@@ -73,6 +73,29 @@ void editorInsertNewline(editorConfig* const E) {
     E->cx = new_cx;
 }
 
+void editorDelWord(editorConfig* const E) {
+    if (E->cy == E->numrows) return;
+    if (E->cx == 0 && E->cy == 0) return;
+
+    erow* row = &E->row[E->cy];
+
+    if (E->cx > 0) {
+        int is_space = isspace((int)row->chars[E->cx - 1]);
+        while(E->cx > 0){
+            if (isspace((int)row->chars[E->cx - 1]) != is_space)
+                break;
+            editorRowDelChar(E, row, E->cx - 1);
+            --E->cx;
+        }
+
+    } else {
+        E->cx = E->row[E->cy - 1].size;
+        editorRowAppendString(E, &E->row[E->cy - 1], row->chars, row->size);
+        editorDelRow(E, E->cy);
+        --E->cy;
+    }
+}
+
 void editorDelChar(editorConfig* const E) {
     if (E->cy == E->numrows) return;
     if (E->cx == 0 && E->cy == 0) return;

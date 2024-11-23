@@ -127,7 +127,9 @@ void editorProcessKeypress(editorConfig* const editor) {
         editorFind(editor);
         break;
     case CTRL_KEY('h'):
+        editorDelWord(editor);
         break;
+    
     case BACKSPACE:
     case DEL_KEY:
         if (c == DEL_KEY) editorMoveCursor(editor, ARROW_RIGHT);

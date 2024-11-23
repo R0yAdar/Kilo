@@ -11,6 +11,8 @@ void editorCopyIndentation(const char* indentation_source, const char* text_sour
 
 void editorInsertNewline(editorConfig* const E);
 
+void editorDelWord(editorConfig* const E);
+
 void editorDelChar(editorConfig* const E);
 
 /*** find ***/
