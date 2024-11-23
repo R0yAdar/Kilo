@@ -6,6 +6,7 @@
 
 #include "lifetime.h"
 #include "datatypes.h"
+#include "io.h"
 
 int mapCharToMovementKey(char c){
     switch (c)

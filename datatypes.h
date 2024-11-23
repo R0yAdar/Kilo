@@ -1,5 +1,8 @@
 #include <time.h>
 #include <termios.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 #ifndef DATATYPES_H
 #define DATATYPES_H
@@ -65,5 +68,19 @@ typedef struct editorConfig {
     editorSyntax* syntax;
     struct termios orig_termios;
 } editorConfig;
+
+/*** append buffer ***/
+
+typedef struct abuf {
+    char* data;
+    int len;
+
+} abuf;
+
+int abAppend(abuf* ab, const char* s, int len);
+
+void abFree(abuf* ab);
+
+#define ABUF_INIT {NULL , 0}
 
 #endif
